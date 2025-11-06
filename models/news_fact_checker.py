@@ -3,21 +3,15 @@
 """
 import asyncio
 import aiohttp
-import pandas as pd
-import numpy as np
 import time
-import copy
-from typing import List, Dict, Tuple, Any
-from numpy.linalg import norm
-from sklearn.metrics import f1_score
+from typing import List, Dict, Any
 
 # 导入配置
 from config import (
-    API_KEY, API_URL, API_MODEL, API_TIMEOUT,
     TEMPERATURE, MAX_TOKENS,
     BATCH_SIZE, MAX_CONCURRENCY, BATCH_DELAY, REQUEST_DELAY,
     DATASET_CONFIGS,
-    SSR_K, SSR_EMBEDDING_MODEL, SSR_TFIDF_MAX_FEATURES,
+    SSR_K,
     RID_NUM_EXAMPLES, RID_MAX_RULES,
     IAI_MAX_THOUGHT_LENGTH,
     FAKE_INDICATORS, REAL_INDICATORS,
@@ -27,14 +21,18 @@ from config import (
     SIMPLE_PROMPT_TEMPLATE
 )
 
-# 尝试导入 sentence-transformers，如果失败则使用简单的 TF-IDF
-try:
-    from sentence_transformers import SentenceTransformer
-    USE_SBERT = True
-except ImportError:
-    print("警告: sentence-transformers 未安装，将使用简单的文本相似度方法")
-    USE_SBERT = False
-    from sklearn.feature_extraction.text import TfidfVectorizer
+# 导入工具函数
+from utils import (
+    preprocess_data,
+    extract_answer,
+    extract_thought,
+    extract_rules_from_response,
+    calculate_metrics,
+    EmbeddingComputer,
+    compute_similarity_scores,
+    extract_top_k_similar,
+    fetch_api
+)
 
 
 class NewsFactChecker:
@@ -67,48 +65,16 @@ class NewsFactChecker:
         
         # 初始化文本嵌入模型（用于 SSR）
         if self.use_mind:
-            if USE_SBERT:
-                print("加载 sentence-transformers 模型用于 SSR...")
-                self.embedding_model = SentenceTransformer(SSR_EMBEDDING_MODEL)
-            else:
-                print("使用 TF-IDF 进行文本相似度计算...")
-                self.embedding_model = None
-                self.tfidf_vectorizer = TfidfVectorizer(max_features=SSR_TFIDF_MAX_FEATURES)
+            self.embedding_computer = EmbeddingComputer()
+        else:
+            self.embedding_computer = None
         
         # 存储训练数据（用于 SSR）
         self.train_data = None
         self.train_embeddings = None
         self.train_texts = None
 
-    def preprocess_data(self, data_path: str, dataset_type: str = "politifact") -> pd.DataFrame:
-        """数据预处理"""
-        df = pd.read_pickle(data_path)
-        
-        # 文本清理
-        df["text"] = df["text"].str.replace(r"[^\w\s\u4e00-\u9fa5]", "", regex=True)
-        df["text"] = df["text"].str.strip()
-        
-        # 数据验证
-        df = df.dropna(subset=["text"])
-        df = df[df["text"].str.len() >= 10]
-        
-        # 标签平衡
-        if "label" in df.columns:
-            min_count = df["label"].value_counts().min()
-            df_balanced = df.groupby("label").head(min_count).reset_index(drop=True)
-            return df_balanced
-        return df
-
-    def _compute_embeddings(self, texts: List[str]) -> np.ndarray:
-        """计算文本嵌入向量"""
-        if USE_SBERT and self.embedding_model:
-            return self.embedding_model.encode(texts, show_progress_bar=False)
-        else:
-            # 使用 TF-IDF
-            vectors = self.tfidf_vectorizer.fit_transform(texts)
-            return vectors.toarray()
-
-    def ssr_similar_sample_retrieval(self, test_texts: List[str], train_df: pd.DataFrame) -> List[Dict]:
+    def ssr_similar_sample_retrieval(self, test_texts: List[str], train_df: Any) -> List[Dict]:
         """
         SSR: 相似样本检索 (Similar Sample Retrieval)
         使用文本嵌入模型找到每个测试样本的 top-k 相似训练样本
@@ -117,53 +83,22 @@ class NewsFactChecker:
         
         # 准备训练数据
         self.train_texts = train_df["text"].tolist()
-        train_labels = train_df["label"].tolist() if "label" in train_df.columns else [None] * len(self.train_texts)
         
         # 计算训练数据嵌入
         print("计算训练数据嵌入...")
-        self.train_embeddings = self._compute_embeddings(self.train_texts)
+        self.train_embeddings = self.embedding_computer.compute_embeddings(self.train_texts)
         
         # 计算测试数据嵌入
         print("计算测试数据嵌入...")
-        test_embeddings = self._compute_embeddings(test_texts)
+        test_embeddings = self.embedding_computer.compute_embeddings(test_texts)
         
         # 计算相似度
         print("计算相似度分数...")
-        similarity_scores = np.zeros((len(test_embeddings), len(self.train_embeddings)))
-        
-        dot_products = np.dot(test_embeddings, self.train_embeddings.T)
-        norms_test = norm(test_embeddings, axis=1, keepdims=True)
-        norms_train = norm(self.train_embeddings, axis=1, keepdims=True).T
-        
-        norms_test[norms_test == 0] = 1
-        norms_train[norms_train == 0] = 1
-        similarity_scores = dot_products / (norms_test * norms_train)
-        similarity_scores = np.clip(similarity_scores, -1.0, 1.0)
-        similarity_scores[similarity_scores >= 1.0] = 0.0
+        similarity_scores = compute_similarity_scores(test_embeddings, self.train_embeddings)
         
         # 提取 top-k 相似样本
-        similarity_scores_copy = copy.deepcopy(similarity_scores)
-        results = []
-        
         print(f"提取 top-{self.ssr_k} 相似样本...")
-        for i in range(len(test_embeddings)):
-            samples = []
-            scores = []
-            current_scores = similarity_scores_copy[i]
-            
-            for _ in range(self.ssr_k):
-                if np.max(current_scores) <= 0:
-                    break
-                j = int(np.argmax(current_scores))
-                samples.append(j)
-                scores.append(float(current_scores[j]))
-                current_scores[j] = -1
-            
-            results.append({
-                "index": i,
-                "samples": samples,  # 训练样本索引
-                "scores": scores,  # 相似度分数
-            })
+        results = extract_top_k_similar(similarity_scores, self.ssr_k)
         
         print(f"✅ SSR 完成: {len(results)} 个测试样本")
         return results
@@ -174,28 +109,14 @@ class NewsFactChecker:
 
     async def _fetch_api(self, session: aiohttp.ClientSession, prompt: str) -> str:
         """异步调用 API"""
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": API_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens
-        }
-        
-        try:
-            await asyncio.sleep(self.request_delay)
-            async with session.post(API_URL, headers=headers, json=payload, timeout=self.timeout) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    if 'choices' in result and len(result['choices']) > 0:
-                        return result['choices'][0]['message']['content'].strip()
-                return "API请求失败"
-        except Exception as e:
-            print(f"API调用失败：{e}")
-            return f"API调用失败: {e}"
+        return await fetch_api(
+            session=session,
+            prompt=prompt,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            timeout=self.timeout,
+            request_delay=self.request_delay
+        )
 
     async def rid_relevant_insight_derivation(self, ssr_results: List[Dict], train_df: pd.DataFrame) -> List[Dict]:
         """
@@ -235,13 +156,9 @@ class NewsFactChecker:
             
             # 处理响应并更新规则
             for response in responses:
-                if "更新后的规则：" in response:
-                    rules = response.split("更新后的规则：", 1)[-1].strip()
-                elif "更新后的规则" in response:
-                    # 尝试其他可能的格式
-                    parts = response.split("更新后的规则")
-                    if len(parts) > 1:
-                        rules = parts[-1].strip().strip("：").strip(":").strip()
+                extracted_rules = extract_rules_from_response(response)
+                if extracted_rules != "尚无规则。":
+                    rules = extracted_rules
             
             return rules
         
@@ -286,28 +203,11 @@ class NewsFactChecker:
 
     def _extract_answer(self, response: str) -> str:
         """从响应中提取答案"""
-        response_lower = response.lower()
-        if "答案：" in response:
-            answer = response.split("答案：")[-1].split('.')[0].strip().strip('[').strip(']')
-        elif "answer:" in response_lower:
-            answer = response_lower.split("answer:")[-1].split('.')[0].strip().strip('[').strip(']')
-        else:
-            # 尝试直接查找关键词
-            if "虚假" in response or "false" in response_lower:
-                answer = "虚假"
-            elif "真实" in response or "true" in response_lower:
-                answer = "真实"
-            else:
-                answer = "未知"
-        return answer
+        return extract_answer(response)
 
     def _extract_thought(self, response: str) -> str:
         """从响应中提取思考过程"""
-        if "思考：" in response:
-            return response.split("思考：")[-1]
-        elif "thought:" in response.lower():
-            return response.split("thought:")[-1]
-        return response
+        return extract_thought(response)
 
     async def iai_insight_augmented_inference(self, test_texts: List[str], rid_results: List[Dict]) -> List[Dict]:
         """
@@ -376,55 +276,7 @@ class NewsFactChecker:
 
     def calculate_metrics(self, true_labels: List[str], pred_labels: List[str]) -> Dict[str, float]:
         """计算评估指标"""
-        # 统一标签格式
-        true_labels_processed = []
-        pred_labels_processed = []
-        
-        for t, p in zip(true_labels, pred_labels):
-            # 处理真实标签
-            t_str = str(t).lower()
-            if t_str in ["虚假", "false", "1", "fake"]:
-                true_labels_processed.append(1)
-            elif t_str in ["真实", "true", "0", "real"]:
-                true_labels_processed.append(0)
-            else:
-                continue
-            
-            # 处理预测标签
-            p_str = str(p).lower()
-            if p_str in ["虚假", "false", "1", "fake"]:
-                pred_labels_processed.append(1)
-            elif p_str in ["真实", "true", "0", "real"]:
-                pred_labels_processed.append(0)
-            else:
-                # 如果无法识别，假设为错误预测
-                pred_labels_processed.append(1 - true_labels_processed[-1])
-        
-        if len(true_labels_processed) == 0:
-            return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
-        
-        # 计算混淆矩阵
-        tp = sum(t == 1 and p == 1 for t, p in zip(true_labels_processed, pred_labels_processed))
-        tn = sum(t == 0 and p == 0 for t, p in zip(true_labels_processed, pred_labels_processed))
-        fp = sum(t == 0 and p == 1 for t, p in zip(true_labels_processed, pred_labels_processed))
-        fn = sum(t == 1 and p == 0 for t, p in zip(true_labels_processed, pred_labels_processed))
-        
-        # 计算指标
-        total = len(true_labels_processed)
-        accuracy = (tp + tn) / total if total > 0 else 0.0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        macro_f1 = f1_score(true_labels_processed, pred_labels_processed, average='macro')
-        
-        return {
-            "accuracy": round(accuracy, 3),
-            "precision": round(precision, 3),
-            "recall": round(recall, 3),
-            "f1": round(f1, 3),
-            "macro_f1": round(macro_f1, 3),
-            "tp": tp, "tn": tn, "fp": fp, "fn": fn
-        }
+        return calculate_metrics(true_labels, pred_labels)
 
     async def run_with_mind(self, test_data_path: str, train_data_path: str, 
                            dataset_type: str = "politifact") -> Dict[str, Any]:
@@ -442,8 +294,8 @@ class NewsFactChecker:
         
         # 1. 数据预处理
         print("--- 步骤 1: 数据预处理 ---")
-        test_df = self.preprocess_data(test_data_path, dataset_type)
-        train_df = self.preprocess_data(train_data_path, dataset_type)
+        test_df = preprocess_data(test_data_path, dataset_type)
+        train_df = preprocess_data(train_data_path, dataset_type)
         
         test_texts = test_df["text"].tolist()
         true_labels = test_df["label"].tolist() if "label" in test_df.columns else []
@@ -495,7 +347,7 @@ class NewsFactChecker:
             self.max_concurrency = config["max_concurrency"]
         
         # 数据预处理
-        df = self.preprocess_data(data_path, dataset_type)
+        df = preprocess_data(data_path, dataset_type)
         texts = df["text"].tolist()
         true_labels = df["label"].tolist() if "label" in df.columns else []
         
